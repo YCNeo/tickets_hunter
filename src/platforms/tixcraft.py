@@ -1738,7 +1738,7 @@ async def nodriver_tixcraft_area_auto_select(tab, url, config_dict):
         for keyword_index, area_keyword_item in enumerate(area_keyword_array):
             debug.log(f"[AREA KEYWORD] Checking keyword #{keyword_index + 1}: {area_keyword_item}")
 
-            is_need_refresh, matched_blocks = await nodriver_get_tixcraft_target_area(el, config_dict, area_keyword_item)
+            is_need_refresh, matched_blocks = await nodriver_get_tixcraft_target_area(tab, config_dict, area_keyword_item)
 
             if not is_need_refresh:
                 # T013: Keyword matched log
@@ -1757,7 +1757,7 @@ async def nodriver_tixcraft_area_auto_select(tab, url, config_dict):
                 # T022: Fallback enabled - use auto_select_mode without keyword
                 debug.log(f"[AREA FALLBACK] area_auto_fallback=true, triggering auto fallback")
                 debug.log(f"[AREA FALLBACK] Selecting available area based on area_select_order='{auto_select_mode}'")
-                is_need_refresh, matched_blocks = await nodriver_get_tixcraft_target_area(el, config_dict, "")
+                is_need_refresh, matched_blocks = await nodriver_get_tixcraft_target_area(tab, config_dict, "")
                 is_fallback_selection = True  # Mark as fallback selection
             else:
                 # T023: Fallback disabled - strict mode (no selection, but still reload)
@@ -1767,7 +1767,7 @@ async def nodriver_tixcraft_area_auto_select(tab, url, config_dict):
                 # matched_blocks remains None (no selection will be made)
                 # is_need_refresh remains True (will trigger reload)
     else:
-        is_need_refresh, matched_blocks = await nodriver_get_tixcraft_target_area(el, config_dict, "")
+        is_need_refresh, matched_blocks = await nodriver_get_tixcraft_target_area(tab, config_dict, "")
         # No keyword specified, treat as mode-based selection (similar to fallback)
         if not area_keyword:
             is_fallback_selection = True
@@ -1785,9 +1785,12 @@ async def nodriver_tixcraft_area_auto_select(tab, url, config_dict):
         # T013: Log selected area with selection type
         if debug.enabled:
             try:
-                area_text = await target_area.text
-                if not area_text:
-                    area_text = await target_area.inner_text
+                if isinstance(target_area, dict):
+                    area_text = target_area.get("text", "")
+                else:
+                    area_text = await target_area.text
+                    if not area_text:
+                        area_text = await target_area.inner_text
                 area_text = area_text.strip()[:80] if area_text else "Unknown"
                 selection_type = "fallback" if is_fallback_selection else "keyword match"
                 debug.log(f"[AREA SELECT] Selected area: {area_text} ({selection_type})")
@@ -1795,10 +1798,40 @@ async def nodriver_tixcraft_area_auto_select(tab, url, config_dict):
                 pass  # If text extraction fails, skip logging
 
         try:
-            await target_area.click()
+            if isinstance(target_area, dict):
+                target_index = int(target_area.get("index", -1))
+                click_result = await tab.evaluate(f'''
+                    (function() {{
+                        const zone = document.querySelector('.zone');
+                        const target = zone ? zone.querySelectorAll('a')[{target_index}] : null;
+                        if (!target) return false;
+                        target.click();
+                        return true;
+                    }})();
+                ''')
+                if not click_result:
+                    target_href = target_area.get("href", "")
+                    if target_href:
+                        await tab.evaluate(f'''
+                            (function() {{
+                                window.location.href = {json.dumps(target_href)};
+                            }})();
+                        ''')
+            else:
+                await target_area.click()
         except:
             try:
-                await target_area.evaluate('el => el.click()')
+                if isinstance(target_area, dict):
+                    target_index = int(target_area.get("index", -1))
+                    await tab.evaluate(f'''
+                        (function() {{
+                            const zone = document.querySelector('.zone');
+                            const target = zone ? zone.querySelectorAll('a')[{target_index}] : null;
+                            if (target) target.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true }}));
+                        }})();
+                    ''')
+                else:
+                    await target_area.evaluate('el => el.click()')
             except:
                 pass
 
@@ -1815,7 +1848,9 @@ async def nodriver_tixcraft_area_auto_select(tab, url, config_dict):
         except Exception:
             pass
 
-async def nodriver_get_tixcraft_target_area(el, config_dict, area_keyword_item):
+async def nodriver_get_tixcraft_target_area(tab, config_dict, area_keyword_item):
+    import json
+
     area_auto_select_mode = config_dict["area_auto_select"]["mode"]
     debug = util.create_debug_logger(config_dict)
     is_need_refresh = False
@@ -1834,14 +1869,30 @@ async def nodriver_get_tixcraft_target_area(el, config_dict, area_keyword_item):
             debug.log(f"[AREA KEYWORD] No keyword specified, matching all areas")
             debug.log(f"[AREA KEYWORD] Auto-select mode: {area_auto_select_mode}")
 
-    if not el:
+    if not tab:
         debug.log(f"[AREA KEYWORD] Element is None, cannot select area")
         return True, None
 
     try:
-        area_list = await el.query_selector_all('a')
-    except:
-        debug.log(f"[AREA KEYWORD] Failed to query area list")
+        area_list_json = await tab.evaluate('''
+            (function() {
+                const zone = document.querySelector('.zone');
+                if (!zone) return "[]";
+                return JSON.stringify(Array.from(zone.querySelectorAll('a')).map((row, index) => {
+                const font = row.querySelector('font');
+                return {
+                    index,
+                    html: row.innerHTML || "",
+                    text: (row.textContent || "").trim(),
+                    href: row.href || row.getAttribute('href') || "",
+                    fontText: font ? (font.textContent || "").trim() : ""
+                };
+                }));
+            })();
+        ''')
+        area_list = json.loads(area_list_json) if area_list_json else []
+    except Exception as exc:
+        debug.log(f"[AREA KEYWORD] Failed to query area list: {exc}")
         return True, None
 
     if not area_list or len(area_list) == 0:
@@ -1857,7 +1908,7 @@ async def nodriver_get_tixcraft_target_area(el, config_dict, area_keyword_item):
         area_index += 1
 
         try:
-            row_html = await row.get_html()
+            row_html = row.get("html", "")
             row_text = util.remove_html_tags(row_html)
         except:
             debug.log(f"[AREA KEYWORD] [{area_index}] Failed to get row content")
@@ -1904,21 +1955,19 @@ async def nodriver_get_tixcraft_target_area(el, config_dict, area_keyword_item):
         # Check seat availability for multiple tickets
         if config_dict["ticket_number"] > 1:
             try:
-                font_el = await row.query_selector('font')
-                if font_el:
-                    font_text = await font_el.evaluate('el => el.textContent')
-                    if font_text:
-                        font_text = "@%s@" % font_text
+                font_text = row.get("fontText", "")
+                if font_text:
+                    font_text = "@%s@" % font_text
 
-                        debug.log(f"[AREA KEYWORD]   Checking seats: {font_text.strip('@')}")
+                    debug.log(f"[AREA KEYWORD]   Checking seats: {font_text.strip('@')}")
 
-                        # Skip if only 1-9 seats remaining
-                        SEATS_1_9 = ["@%d@" % i for i in range(1, 10)]
-                        if any(seat in font_text for seat in SEATS_1_9):
-                            debug.log(f"[AREA KEYWORD]   Insufficient seats (need {config_dict['ticket_number']}, only {font_text.strip('@')} available)")
-                            continue
-                        else:
-                            debug.log(f"[AREA KEYWORD]   Sufficient seats available")
+                    # Skip if only 1-9 seats remaining
+                    SEATS_1_9 = ["@%d@" % i for i in range(1, 10)]
+                    if any(seat in font_text for seat in SEATS_1_9):
+                        debug.log(f"[AREA KEYWORD]   Insufficient seats (need {config_dict['ticket_number']}, only {font_text.strip('@')} available)")
+                        continue
+                    else:
+                        debug.log(f"[AREA KEYWORD]   Sufficient seats available")
             except:
                 pass
 
@@ -3123,4 +3172,3 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
             _state["printed_completed"] = True
 
     return is_quit_bot
-
